@@ -1,0 +1,51 @@
+name: release
+
+# Windows stays on cargo and dx in ci.yml. It is not part of the Nix hash.
+# Signing secrets are CI store names. This file does not contain keystore bytes.
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  licence:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: F-Droid feature set
+        run: bash scripts/licence-audit.sh --fdroid
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: require signing secrets from the CI store
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: test -n "$ANDROID_KEYSTORE_BASE64" && test -n "$ANDROID_KEYSTORE_PASSWORD"
+
+  cachix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: folio
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: true
+      - name: payload compare is not a Rust-hash check
+        run: echo "scripts/apk-payload.sh compares two APKs after excluding META-INF/. This job does not build Pdfium."
+
+  publish:
+    needs: [licence, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: metadata/release-notes-full.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

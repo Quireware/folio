@@ -1,0 +1,12 @@
+[package]
+name = "unrar-default-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+unrar = { version = "0.5", optional = true }
+
+[features]
+default = ["cbr"]
+cbr = ["dep:unrar"]

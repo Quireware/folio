@@ -1,0 +1,15 @@
+[package]
+name = "folio-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+folio-core = { path = "../folio-core" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+folio-storage = { path = "../folio-storage" }
+tempfile = "3"

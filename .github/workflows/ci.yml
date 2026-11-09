@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: test
+        run: cargo test --workspace
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: licence audit
+        run: bash scripts/licence-audit.sh && bash scripts/licence-audit.sh --fdroid
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - uses: android-actions/setup-android@v3
+      - name: install dx 0.7.10
+        run: cargo install dioxus-cli --version 0.7.10 --locked
+      - name: debug apk
+        run: bash scripts/build-apk-debug.sh
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo build
+        run: cargo build --workspace
+      - name: install dx 0.7.10
+        run: cargo install dioxus-cli --version 0.7.10 --locked
+      - name: dx bundle
+        run: dx bundle

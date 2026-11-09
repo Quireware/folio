@@ -1,0 +1,12 @@
+[application]
+name = "folio-spike"
+
+[bundle]
+identifier = "dev.folio.spike"
+
+[android]
+min_sdk = 24
+target_sdk = 34
+
+[android.application]
+uses_cleartext_traffic = true

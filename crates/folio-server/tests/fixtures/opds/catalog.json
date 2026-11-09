@@ -1,0 +1,27 @@
+{
+  "metadata": {"title": "Root"},
+  "links": [
+    {
+      "rel": "search",
+      "href": "http://127.0.0.1:9/search?q={searchTerms}",
+      "templated": true,
+      "type": "application/opds+json"
+    }
+  ],
+  "navigation": [
+    {"title": "Fiction", "href": "http://127.0.0.1:9/fiction"},
+    {"title": "Comics", "href": "http://127.0.0.1:9/comics"}
+  ],
+  "publications": [
+    {
+      "metadata": {"title": "Dune", "identifier": "dune"},
+      "links": [
+        {
+          "rel": "http://opds-spec.org/acquisition",
+          "href": "http://127.0.0.1:9/dune.epub",
+          "type": "application/epub+zip"
+        }
+      ]
+    }
+  ]
+}

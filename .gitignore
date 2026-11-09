@@ -1,3 +1,6 @@
+# Local agent plans and handoffs. Not part of the program.
+/agents/
+
 # Cargo. `target` also covers spike/target and target/dx.
 target
 debug

@@ -1,0 +1,19 @@
+[application]
+name = "folio"
+
+[bundle]
+identifier = "dev.folio.reader"
+
+[android]
+min_sdk = 24
+target_sdk = 34
+# The installed Nix SDK has platform 35, not 34, and the store is read-only.
+compile_sdk = 35
+
+[android.application]
+uses_cleartext_traffic = true
+large_heap = true
+
+[android.permissions]
+"android.permission.MANAGE_EXTERNAL_STORAGE" = { description = "Read books in shared storage" }
+"android.permission.READ_EXTERNAL_STORAGE" = { description = "Read books on older Android versions" }

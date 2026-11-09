@@ -1,0 +1,10 @@
+Full release.
+
+Included: local reading, collections, tags, ratings, history, the download queue,
+OPDS 1.2 and 2.0 browse, Komga and Kavita browse, and Komga progress sync.
+Kavita progress is read-only. librarian has no content or progress protocol.
+
+Not included in this revision: a checked emulator widget, a Pdfium-from-source
+APK, and two matching Nix or F-Droid APK payloads. Compare those with
+scripts/apk-payload.sh after META-INF signing entries are excluded.
+The optional rar archive feature is not part of the F-Droid build.

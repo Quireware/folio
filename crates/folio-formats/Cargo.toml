@@ -1,0 +1,28 @@
+[package]
+name = "folio-formats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+cbr = []
+
+[dependencies]
+folio-core = { path = "../folio-core" }
+hayro = { version = "0.5.0", features = ["embed-fonts"] }
+pdfium-render = { version = "0.9.5", default-features = false, features = ["image_latest", "pdfium_7763", "thread_safe"] }
+rar-codec = "0.1.9"
+roxmltree = "0.20"
+sevenz-rust2 = { version = "0.20.2", default-features = false, features = ["compress"] }
+tar = "0.4"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+folio-platform = { path = "../folio-platform" }
+sevenz-rust2 = { version = "0.20.2", default-features = false, features = ["compress"] }
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }

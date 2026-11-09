@@ -1,0 +1,21 @@
+[package]
+name = "folio-library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+folio-core = { path = "../folio-core" }
+folio-formats = { path = "../folio-formats" }
+folio-platform = { path = "../folio-platform" }
+folio-storage = { path = "../folio-storage" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = "2"
+
+[dev-dependencies]
+sevenz-rust2 = { version = "0.20.2", default-features = false, features = ["compress"] }
+tar = "0.4"
+tempfile = "3"
+zip = { version = "2", default-features = false, features = ["deflate"] }

@@ -1,0 +1,83 @@
+{
+  "lockfile_version": "1",
+  "packages": {
+    "dioxus-cli@0.7.10": {
+      "last_modified": "2026-10-07T09:43:42Z",
+      "resolved": "github:NixOS/nixpkgs/39ad350a0602fa0a58a544344e3e9187526ea45c#dioxus-cli",
+      "source": "devbox-search",
+      "version": "0.7.10",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/nm3xfb4204g7gs7b1hl13nrr9m877mb2-dioxus-cli-0.7.10",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/nm3xfb4204g7gs7b1hl13nrr9m877mb2-dioxus-cli-0.7.10"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/vvn5mllf1m6iwbc9x5bsjhdlxcr3b30i-dioxus-cli-0.7.10",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/vvn5mllf1m6iwbc9x5bsjhdlxcr3b30i-dioxus-cli-0.7.10"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/iv1x5c85zcqpsjp29a82iffjr99ld47f-dioxus-cli-0.7.10",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/iv1x5c85zcqpsjp29a82iffjr99ld47f-dioxus-cli-0.7.10"
+        }
+      }
+    },
+    "github:NixOS/nixpkgs/nixpkgs-unstable": {
+      "last_modified": "2026-10-08T19:21:32Z",
+      "resolved": "github:NixOS/nixpkgs/8edc0c72e3a38faf5434e40d1f19431125fe4b30?lastModified=1791487292&narHash=sha256-tqM7xDEsaeK1p6VvRygeZ9LkQRpUUkbRT02BHv6hnTM%3D"
+    },
+    "jdk@21.0.7+6": {
+      "last_modified": "2025-07-28T17:09:23Z",
+      "resolved": "github:NixOS/nixpkgs/648f70160c03151bc2121d179291337ad6bc564b#jdk",
+      "source": "devbox-search",
+      "version": "21.0.7+6",
+      "systems": {
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/5fagbi9k08a5xksck8q5gb7p86xp1a29-openjdk-21.0.7+6",
+              "default": true
+            },
+            {
+              "name": "debug",
+              "path": "/nix/store/7bvg3h639wp3kgpfnghhlia3z7wdpwl2-openjdk-21.0.7+6-debug"
+            }
+          ],
+          "store_path": "/nix/store/5fagbi9k08a5xksck8q5gb7p86xp1a29-openjdk-21.0.7+6"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/fnshd55b29s6z88mfl3ilmdqfb7l3dqi-openjdk-21.0.7+6",
+              "default": true
+            },
+            {
+              "name": "debug",
+              "path": "/nix/store/3bvbwliba77ahwlibxymzlbz83i84vyy-openjdk-21.0.7+6-debug"
+            }
+          ],
+          "store_path": "/nix/store/fnshd55b29s6z88mfl3ilmdqfb7l3dqi-openjdk-21.0.7+6"
+        }
+      }
+    }
+  }
+}

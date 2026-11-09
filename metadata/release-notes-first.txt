@@ -1,0 +1,5 @@
+First release.
+
+Servers, downloads, collections, and background playback are absent.
+The reader is local EPUB, CBZ, CB7, CBT, PDF, and image folders.
+The optional rar archive feature is not part of this build.

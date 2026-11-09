@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Root</title>
+  <link rel="search" type="application/atom+xml" href="http://127.0.0.1:9/search?q={searchTerms}"/>
+  <entry>
+    <title>Fiction</title>
+    <link rel="subsection" href="http://127.0.0.1:9/fiction" type="application/atom+xml;profile=opds-catalog"/>
+  </entry>
+  <entry>
+    <title>Comics</title>
+    <link rel="subsection" href="http://127.0.0.1:9/comics" type="application/atom+xml;profile=opds-catalog"/>
+  </entry>
+  <entry>
+    <title>Dune</title>
+    <id>dune</id>
+    <link rel="http://opds-spec.org/acquisition" href="http://127.0.0.1:9/dune.epub" type="application/epub+zip"/>
+  </entry>
+</feed>

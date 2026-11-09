@@ -1,0 +1,9 @@
+version: "0.5"
+
+processes:
+  folio:
+    command: cargo run -p folio-app --bin folio
+    working_dir: .
+  librarian:
+    command: cargo run -p librarian-cli -- serve
+    working_dir: ../librarian

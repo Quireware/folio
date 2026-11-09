@@ -1,0 +1,22 @@
+Categories:
+  - Reading
+License: MIT
+AuthorName: Quireware
+SourceCode: https://github.com/quireware/folio
+IssueTracker: https://github.com/quireware/folio/issues
+Name: Folio
+Summary: Local ebook and comic reader
+Description: |
+    Folio reads EPUB, CBZ, CB7, CBT, PDF, and image folders on device.
+    The F-Droid build leaves the optional rar archive feature off.
+RepoType: git
+Repo: https://github.com/quireware/folio.git
+Builds:
+  - versionName: 0.1.0
+    versionCode: 1
+    commit: HEAD
+    subdir: crates/folio-app
+    output: build/folio.apk
+    build: cargo build --locked --release --manifest-path ../../Cargo.toml -p folio-app
+AutoUpdateMode: None
+UpdateCheckMode: None

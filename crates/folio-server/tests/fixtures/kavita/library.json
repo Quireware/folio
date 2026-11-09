@@ -1,0 +1,6 @@
+{
+  "libraries": [{"id":"lib","name":"Books","href":"http://127.0.0.1:9/api/Library/lib"}],
+  "series": [{"id":"series","name":"Dune","href":"http://127.0.0.1:9/api/Series/series"}],
+  "books": [{"id":"book","name":"Dune","file":"http://127.0.0.1:9/api/Download/book"}],
+  "progress": {"page":2,"completed":false}
+}

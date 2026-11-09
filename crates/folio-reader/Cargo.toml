@@ -1,0 +1,15 @@
+[package]
+name = "folio-reader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = "1"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+folio-storage = { path = "../folio-storage" }
+tempfile = "3"
