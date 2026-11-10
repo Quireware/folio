@@ -191,7 +191,7 @@ fn tab_bar(model: ModelSignal) -> Element {
                     aria_current: current(route_name_is(route, name)),
                     onclick: move |_| set_route(model, route_from_name(name)),
                     span { class: "f-tab__icon", {icons::nav_icon(name)} }
-                    "{label}"
+                    span { class: "f-tab__label", "{label}" }
                 }
             }
         }

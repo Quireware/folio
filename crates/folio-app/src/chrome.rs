@@ -124,10 +124,11 @@ mod tests {
         "f-stack",
     ];
 
-    const MENU_AND_NAV_CLASSES: [&str; 11] = [
+    const MENU_AND_NAV_CLASSES: [&str; 12] = [
         "f-nav",
         "f-tab",
         "f-tab__icon",
+        "f-tab__label",
         "f-menu",
         "f-menu--top",
         "f-menu--bottom",
