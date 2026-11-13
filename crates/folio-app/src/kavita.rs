@@ -25,9 +25,10 @@ use folio_server::{
     KAVITA_PAGE,
 };
 use folio_storage::{
-    acknowledge_kavita_mark, acknowledge_kavita_progress, apply_kavita_pull,
-    enqueue_kavita_download, enqueue_kavita_mark, enqueue_kavita_progress, forget_kavita_server,
-    kavita_marks, kavita_outbox, publish_kavita_mirror, remove_server, replace_kavita_chapters,
+    acknowledge_kavita_mark, acknowledge_kavita_progress, apply_kavita_pull, drop_kavita_series,
+    drop_orphan_kavita_downloads, enqueue_kavita_download, enqueue_kavita_mark,
+    enqueue_kavita_progress, forget_kavita_server, kavita_marks, kavita_mirror_mutated,
+    kavita_outbox, publish_kavita_mirror, remove_server, replace_kavita_chapters,
     reset_kavita_server, servers, swap_server, upsert_server, KavitaBookmarkRow, KavitaChapterRow,
     KavitaHomeRow, KavitaKeep, KavitaLibraryRow, KavitaMarkRow, KavitaMirror, KavitaNamedRow,
     KavitaOutboxRow, KavitaSeriesRow, StoredServer,
@@ -362,6 +363,7 @@ pub fn connection_failure(error: &SessionError) -> String {
         SessionError::Changed => {
             "The server was changed while Folio read it. Try again.".to_owned()
         }
+        SessionError::Hidden => "That series is not in the library.".to_owned(),
         SessionError::Mirror { step, error } => match error {
             ServerError::Feed => format!("Kavita answered, but {step} could not be read."),
             ServerError::Transport => {
@@ -505,17 +507,33 @@ fn remove_server_downloads(files_dir: &Path, server_id: &str) -> Result<(), Sess
         if !name.starts_with(&prefix) {
             continue;
         }
-        let path = root.join(name);
-        if path.parent() != Some(root.as_path()) {
-            continue;
-        }
-        match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() => fs::remove_file(&path)?,
-            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&path)?,
-            Ok(_) => fs::remove_file(&path)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        remove_download_path(&root, name)?;
+    }
+    Ok(())
+}
+
+fn remove_download_dirs(files_dir: &Path, ids: &[String]) -> Result<(), SessionError> {
+    let root = download_root(files_dir);
+    for id in ids {
+        remove_download_path(&root, id)?;
+    }
+    Ok(())
+}
+
+fn remove_download_path(root: &Path, name: &str) -> Result<(), SessionError> {
+    if !safe_segment(name) {
+        return Ok(());
+    }
+    let path = root.join(name);
+    if path.parent() != Some(root) {
+        return Ok(());
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => fs::remove_file(&path)?,
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(&path)?,
+        Ok(_) => fs::remove_file(&path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     Ok(())
 }
@@ -598,11 +616,25 @@ pub fn publish_mirror(
     api_key: &str,
     snapshot: MirrorSnapshot,
 ) -> Result<MirrorGaps, SessionError> {
+    let mutated = kavita_mirror_mutated(db, server_id)?;
+    publish_mirror_at(db, store, server_id, base, api_key, mutated, snapshot)
+}
+
+fn publish_mirror_at(
+    db: &folio_storage::Database,
+    store: &SecretStore,
+    server_id: &str,
+    base: &str,
+    api_key: &str,
+    expected_mutated: i64,
+    snapshot: MirrorSnapshot,
+) -> Result<MirrorGaps, SessionError> {
     let gaps = snapshot.gaps.clone();
     let published = publish_kavita_mirror(
         db,
         server_id,
         mirror_rows(snapshot),
+        expected_mutated,
         same_account(store, base, api_key),
     )?;
     if published {
@@ -717,7 +749,11 @@ fn named_rows(rows: Vec<KavitaNamed>) -> Vec<KavitaNamedRow> {
 }
 
 /// Fetch the mirror and publish it. A failed fetch does not publish. Returns the replies that
-/// could not be read but did not stop the sync.
+/// could not be read but did not stop the sync. After a successful publish, download rows whose
+/// series is not in the new list are deleted, and their folders under `files_dir` go with them.
+///
+/// `kavita_generation.mutated` is read before the HTTP fetch so a one-series hide during the
+/// fetch refuses this publish.
 ///
 /// # Errors
 ///
@@ -727,13 +763,18 @@ fn named_rows(rows: Vec<KavitaNamed>) -> Vec<KavitaNamedRow> {
 pub fn fetch_and_publish(
     db: &folio_storage::Database,
     store: &SecretStore,
+    files_dir: &Path,
     server_id: &str,
     base: &str,
     api_key: &str,
     allow_invalid_certs: bool,
 ) -> Result<MirrorGaps, SessionError> {
+    let mutated = kavita_mirror_mutated(db, server_id)?;
     let snapshot = fetch_mirror(base, api_key, allow_invalid_certs)?;
-    publish_mirror(db, store, server_id, base, api_key, snapshot)
+    let gaps = publish_mirror_at(db, store, server_id, base, api_key, mutated, snapshot)?;
+    let gone = drop_orphan_kavita_downloads(db, server_id)?;
+    remove_download_dirs(files_dir, &gone)?;
+    Ok(gaps)
 }
 
 /// Download one series cover. The bytes are not a catalog row.
@@ -951,6 +992,7 @@ pub fn queue_chapter(
     server_id: &str,
     origin: &str,
     chapter_id: i64,
+    series_id: i64,
     kind: &str,
 ) -> Result<(), SessionError> {
     let url = chapter_url(origin, chapter_id, kind)?;
@@ -958,7 +1000,7 @@ pub fn queue_chapter(
         return Err(SessionError::Server);
     }
     let id = download_id(server_id, chapter_id);
-    enqueue_kavita_download(db, &id, server_id, &url)?;
+    enqueue_kavita_download(db, &id, server_id, &url, series_id)?;
     Ok(())
 }
 
@@ -1382,6 +1424,81 @@ pub fn fetch_chapters(
     })
 }
 
+/// Fetch volumes for `series_id`. HTTP 401/403 drops that series and returns [`SessionError::Hidden`].
+///
+/// # Errors
+///
+/// Returns [`SessionError::Hidden`] when Kavita refuses the series, [`SessionError::Changed`]
+/// when the account moved, or a remote error when the volumes request fails for any other reason.
+pub fn admit_kavita_series(
+    db: &folio_storage::Database,
+    store: &SecretStore,
+    files_dir: &Path,
+    server_id: &str,
+    origin: (&str, &str),
+    allow_invalid_certs: bool,
+    series_id: i64,
+) -> Result<(), SessionError> {
+    admit_kavita_series_with(
+        db,
+        store,
+        files_dir,
+        server_id,
+        origin,
+        series_id,
+        |request| text_of(request, allow_invalid_certs),
+    )
+}
+
+fn admit_kavita_series_with<F>(
+    db: &folio_storage::Database,
+    store: &SecretStore,
+    files_dir: &Path,
+    server_id: &str,
+    origin: (&str, &str),
+    series_id: i64,
+    fetch: F,
+) -> Result<(), SessionError>
+where
+    F: FnMut(&KavitaRequest) -> Result<String, SessionError>,
+{
+    let (base, api_key) = origin;
+    match refresh_chapters_with(db, store, server_id, base, api_key, series_id, fetch) {
+        Ok(()) => Ok(()),
+        Err(error) if volumes_refused(&error) => {
+            hide_series(db, store, files_dir, server_id, base, api_key, series_id)?;
+            Err(SessionError::Hidden)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn volumes_refused(error: &SessionError) -> bool {
+    matches!(
+        error,
+        SessionError::Remote(ServerError::Refused)
+            | SessionError::Mirror {
+                error: ServerError::Refused,
+                ..
+            }
+    )
+}
+
+fn hide_series(
+    db: &folio_storage::Database,
+    store: &SecretStore,
+    files_dir: &Path,
+    server_id: &str,
+    base: &str,
+    api_key: &str,
+    series_id: i64,
+) -> Result<(), SessionError> {
+    match drop_kavita_series(db, server_id, series_id, same_account(store, base, api_key))? {
+        Some(ids) => remove_download_dirs(files_dir, &ids),
+        None => Err(SessionError::Changed),
+    }
+}
+
 fn refresh_chapters_with<F>(
     db: &folio_storage::Database,
     store: &SecretStore,
@@ -1687,18 +1804,19 @@ pub fn list_page(total: usize, index: usize, size: usize) -> ListPage {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_kavita, chapter_directory, connection_failure, download_root, forget_server,
-        mirror_with, page_from_locator, probe_kavita, publish_mirror, pull_progress, push_with,
-        record_page, refresh_chapters_with, refresh_status, rehome_raw_opds, rename_kavita,
-        replace_kavita, secret_reference, update_kavita, MirrorGaps, MirrorList, MirrorSection,
-        MirrorSnapshot, MirrorStep, PageStop,
+        add_kavita, admit_kavita_series_with, chapter_can_open, chapter_directory,
+        connection_failure, directory_complete, download_root, forget_server, mirror_with,
+        page_from_locator, probe_kavita, publish_mirror, pull_progress, push_with, record_page,
+        refresh_chapters_with, refresh_status, rehome_raw_opds, rename_kavita, replace_kavita,
+        secret_reference, update_kavita, MirrorGaps, MirrorList, MirrorSection, MirrorSnapshot,
+        MirrorStep, PageStop,
     };
     use crate::session::{open_database, SessionError};
     use folio_platform::SecretStore;
     use folio_server::{KavitaBookmark, KavitaNamed, KavitaRequest, KavitaSeries, ServerError};
     use folio_storage::{
-        export_backup, kavita_outbox, kavita_pending, servers, upsert_server,
-        visible_kavita_chapters, visible_kavita_collections, visible_kavita_mirror,
+        enqueue_kavita_download, export_backup, kavita_outbox, kavita_pending, servers,
+        upsert_server, visible_kavita_chapters, visible_kavita_collections, visible_kavita_mirror,
         visible_kavita_series, StoredServer,
     };
 
@@ -1992,10 +2110,11 @@ mod tests {
         assert_eq!(collections.len(), 1);
         assert_eq!(collections[0].name, "Favourites");
         let shown = visible_kavita_mirror(&db, &id).expect("mirror");
-        assert_eq!(
-            shown.shelves.get("on-deck").map(Vec::as_slice),
-            Some(&[7, 5][..])
-        );
+        assert!(shown
+            .shelves
+            .get("on-deck")
+            .unwrap_or(&Vec::new())
+            .is_empty());
         assert!(shown.bookmarks.is_empty());
     }
 
@@ -2485,6 +2604,227 @@ mod tests {
         let missing = connection_failure(&SessionError::Remote(ServerError::Dns));
         assert_eq!(missing, "The server name could not be found.");
         assert!(!missing.contains("://"));
+        assert_eq!(
+            connection_failure(&SessionError::Hidden),
+            "That series is not in the library."
+        );
+    }
+
+    fn complete_chapter(root: &std::path::Path, server_id: &str, chapter_id: i64) {
+        let directory = chapter_directory(&download_root(root), server_id, chapter_id);
+        std::fs::create_dir_all(&directory).expect("dir");
+        std::fs::write(directory.join("page-0.html"), b"<p>hi</p>").expect("page");
+        std::fs::write(directory.join("pages.txt"), "0 0 0\n").expect("pages");
+        std::fs::write(directory.join("complete"), b"").expect("complete");
+    }
+
+    #[test]
+    fn volumes_refused_hides_the_series_and_its_download() {
+        let root = tempfile::tempdir().expect("temp");
+        let db = open_database(root.path()).expect("db");
+        let store = SecretStore::open(root.path()).expect("store");
+        let id = add_kavita(&db, &store, "Home", BASE, "raw-api-key").expect("add");
+        publish_mirror(&db, &store, &id, BASE, "raw-api-key", {
+            let mut snapshot = MirrorSnapshot::empty();
+            snapshot.series.push(KavitaSeries {
+                id: 1,
+                name: "Wings".to_owned(),
+                format: "epub".to_owned(),
+                library_id: 1,
+            });
+            snapshot.series.push(KavitaSeries {
+                id: 2,
+                name: "Tide".to_owned(),
+                format: "epub".to_owned(),
+                library_id: 1,
+            });
+            snapshot
+        })
+        .expect("publish");
+        refresh_chapters_with(
+            &db,
+            &store,
+            &id,
+            BASE,
+            "raw-api-key",
+            1,
+            fake_kavita(Vec::new()),
+        )
+        .expect("chapters");
+        enqueue_kavita_download(
+            &db,
+            &format!("kavita-{id}-11"),
+            &id,
+            "http://kavita.test:5000/chapter",
+            1,
+        )
+        .expect("queue");
+        complete_chapter(root.path(), &id, 11);
+        let mutated = folio_storage::kavita_mirror_mutated(&db, &id).expect("mutated");
+        let error = admit_kavita_series_with(
+            &db,
+            &store,
+            root.path(),
+            &id,
+            (BASE, "raw-api-key"),
+            1,
+            fake_kavita(vec![("/api/Series/volumes", Err(ServerError::Refused))]),
+        )
+        .expect_err("hidden");
+        assert!(matches!(error, SessionError::Hidden));
+        assert_eq!(
+            connection_failure(&error),
+            "That series is not in the library."
+        );
+        let names: Vec<String> = visible_kavita_series(&db, &id)
+            .expect("series")
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(names, ["Tide"]);
+        assert!(!chapter_directory(&download_root(root.path()), &id, 11).exists());
+        assert_eq!(
+            folio_storage::kavita_mirror_mutated(&db, &id).expect("mutated"),
+            mutated + 1
+        );
+    }
+
+    #[test]
+    fn volumes_transport_opens_a_listed_complete_download() {
+        let root = tempfile::tempdir().expect("temp");
+        let db = open_database(root.path()).expect("db");
+        let store = SecretStore::open(root.path()).expect("store");
+        let id = add_kavita(&db, &store, "Home", BASE, "raw-api-key").expect("add");
+        publish_mirror(
+            &db,
+            &store,
+            &id,
+            BASE,
+            "raw-api-key",
+            one_series(1, "Wings"),
+        )
+        .expect("publish");
+        refresh_chapters_with(
+            &db,
+            &store,
+            &id,
+            BASE,
+            "raw-api-key",
+            1,
+            fake_kavita(Vec::new()),
+        )
+        .expect("chapters");
+        complete_chapter(root.path(), &id, 11);
+        let error = admit_kavita_series_with(
+            &db,
+            &store,
+            root.path(),
+            &id,
+            (BASE, "raw-api-key"),
+            1,
+            fake_kavita(vec![("/api/Series/volumes", Err(ServerError::Transport))]),
+        )
+        .expect_err("transport");
+        assert!(matches!(
+            error,
+            SessionError::Mirror {
+                step: MirrorStep::Chapters,
+                error: ServerError::Transport,
+            }
+        ));
+        assert!(chapter_can_open(
+            directory_complete(&chapter_directory(&download_root(root.path()), &id, 11), 1),
+            false
+        ));
+        assert_eq!(visible_kavita_series(&db, &id).expect("kept").len(), 1);
+        assert!(chapter_directory(&download_root(root.path()), &id, 11).exists());
+    }
+
+    #[test]
+    fn empty_volumes_do_not_hide_or_delete_a_download() {
+        let root = tempfile::tempdir().expect("temp");
+        let db = open_database(root.path()).expect("db");
+        let store = SecretStore::open(root.path()).expect("store");
+        let id = add_kavita(&db, &store, "Home", BASE, "raw-api-key").expect("add");
+        publish_mirror(
+            &db,
+            &store,
+            &id,
+            BASE,
+            "raw-api-key",
+            one_series(1, "Wings"),
+        )
+        .expect("publish");
+        refresh_chapters_with(
+            &db,
+            &store,
+            &id,
+            BASE,
+            "raw-api-key",
+            1,
+            fake_kavita(Vec::new()),
+        )
+        .expect("chapters");
+        enqueue_kavita_download(
+            &db,
+            &format!("kavita-{id}-11"),
+            &id,
+            "http://kavita.test:5000/chapter",
+            1,
+        )
+        .expect("queue");
+        complete_chapter(root.path(), &id, 11);
+        admit_kavita_series_with(
+            &db,
+            &store,
+            root.path(),
+            &id,
+            (BASE, "raw-api-key"),
+            1,
+            fake_kavita(vec![("/api/Series/volumes", Ok("[]"))]),
+        )
+        .expect("empty");
+        assert!(visible_kavita_chapters(&db, &id, 1)
+            .expect("chapters")
+            .is_empty());
+        assert_eq!(visible_kavita_series(&db, &id).expect("series").len(), 1);
+        assert!(chapter_directory(&download_root(root.path()), &id, 11).exists());
+    }
+
+    #[test]
+    fn a_stale_refresh_does_not_restore_a_hidden_series() {
+        let root = tempfile::tempdir().expect("temp");
+        let db = open_database(root.path()).expect("db");
+        let store = SecretStore::open(root.path()).expect("store");
+        let id = add_kavita(&db, &store, "Home", BASE, "raw-api-key").expect("add");
+        let snapshot = mirror_with(BASE, "raw-api-key", fake_kavita(Vec::new())).expect("fetch");
+        let mutated = folio_storage::kavita_mirror_mutated(&db, &id).expect("mutated");
+        publish_mirror(&db, &store, &id, BASE, "raw-api-key", snapshot.clone()).expect("first");
+        admit_kavita_series_with(
+            &db,
+            &store,
+            root.path(),
+            &id,
+            (BASE, "raw-api-key"),
+            1,
+            fake_kavita(vec![("/api/Series/volumes", Err(ServerError::Refused))]),
+        )
+        .expect_err("hidden");
+        let stale = folio_storage::publish_kavita_mirror(
+            &db,
+            &id,
+            super::mirror_rows(snapshot),
+            mutated,
+            super::same_account(&store, BASE, "raw-api-key"),
+        )
+        .expect("publish");
+        assert!(!stale);
+        let names: Vec<i64> = visible_kavita_series(&db, &id)
+            .expect("series")
+            .into_iter()
+            .map(|row| row.series_id)
+            .collect();
+        assert!(!names.contains(&1));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use folio_platform::SecretStore;
 use folio_reader::{
     cycle_zoom, image_fit_css, paragraph_css, reader_font, zoom_factor, Fit, SessionZoom, TextAlign,
 };
+use folio_server::ServerError;
 use folio_storage::{
     kavita_downloads, servers, visible_kavita_chapters, visible_kavita_collections,
     visible_kavita_filters, visible_kavita_mirror, visible_kavita_reading_lists,
@@ -18,8 +19,8 @@ use folio_storage::{
 };
 
 use crate::kavita::{
-    bytes_data_url, cancel_downloads, chapter_directory, connection_failure, covers_to_fetch,
-    directory_complete, download_root, fetch_and_publish, fetch_chapters, fetch_cover, fetch_page,
+    admit_kavita_series, bytes_data_url, cancel_downloads, chapter_directory, connection_failure,
+    covers_to_fetch, directory_complete, download_root, fetch_and_publish, fetch_cover, fetch_page,
     list_page, push_pending, queue_chapter, read_key, record_mark, record_page, recover_downloads,
     refresh_status, run_downloads, stored_page, update_kavita, DownloadPolicy, ListPage, PageStop,
 };
@@ -1088,12 +1089,12 @@ fn open_series(mut model: ModelSignal, series_id: i64) {
         let outcome = (|| {
             let (base, key, allow) = account(&server_id)?;
             let store = SecretStore::open(&app_files_dir())?;
-            fetch_chapters(
+            admit_kavita_series(
                 database()?,
                 &store,
+                &app_files_dir(),
                 &server_id,
-                &base,
-                &key,
+                (&base, &key),
                 allow,
                 series_id,
             )
@@ -1108,13 +1109,33 @@ fn open_series(mut model: ModelSignal, series_id: i64) {
         match outcome {
             Ok(()) if still_open => load_panel(model, "detail", series_id),
             Ok(()) => {}
-            Err(error) => model.write().status = connection_failure(&error),
+            Err(SessionError::Hidden) => {
+                model.write().status = connection_failure(&SessionError::Hidden);
+                refresh_kavita(model);
+            }
+            Err(error) => {
+                model.write().status = connection_failure(&error);
+                if still_open {
+                    load_panel(model, "detail", series_id);
+                }
+            }
         }
     });
 }
 
 fn open_chapter(model: ModelSignal, chapter_id: i64) {
     open_chapter_page(model, chapter_id, -1);
+}
+
+fn volumes_offline(error: &SessionError) -> bool {
+    matches!(
+        error,
+        SessionError::Remote(ServerError::Transport | ServerError::Dns | ServerError::Feed)
+            | SessionError::Mirror {
+                error: ServerError::Transport | ServerError::Dns | ServerError::Feed,
+                ..
+            }
+    )
 }
 
 fn open_chapter_page(mut model: ModelSignal, chapter_id: i64, saved_page: i64) {
@@ -1148,29 +1169,68 @@ fn open_chapter_page(mut model: ModelSignal, chapter_id: i64, saved_page: i64) {
         .unwrap_or_else(|| "image".to_owned());
     let library_id = series.as_ref().map(|row| row.library_id).unwrap_or(0);
     let page = if saved_page >= 0 { saved_page } else { 0 };
-    {
-        let mut guard = model.write();
-        guard.remote_epoch = guard.remote_epoch.saturating_add(1);
-        guard.menu = false;
-        guard.zoom = 1;
-        guard.remote = Some(RemoteRead {
-            server_id: server_id.clone(),
-            series_id: chapter.series_id,
-            volume_id: chapter.volume_id,
-            library_id,
-            chapter_id,
-            title: chapter.name.clone(),
-            kind: kind.clone(),
-            page,
-            page_count: chapter.pages.max(1),
-            body: String::new(),
-            html: kind == "epub",
-            failed: false,
-            pdf: None,
-        });
-        guard.status = "Opening".to_owned();
-    }
-    show_page(model, page);
+    let series_id = chapter.series_id;
+    let volume_id = chapter.volume_id;
+    let title = chapter.name.clone();
+    let page_count = chapter.pages.max(1);
+    let pages = chapter.pages;
+    std::thread::spawn(move || {
+        let files = app_files_dir();
+        let outcome = (|| {
+            let (base, key, allow) = account(&server_id)?;
+            let store = SecretStore::open(&files)?;
+            admit_kavita_series(
+                database()?,
+                &store,
+                &files,
+                &server_id,
+                (&base, &key),
+                allow,
+                series_id,
+            )
+        })();
+        match outcome {
+            Ok(()) => {}
+            Err(SessionError::Hidden) => {
+                model.write().status = connection_failure(&SessionError::Hidden);
+                refresh_kavita(model);
+                return;
+            }
+            Err(error) => {
+                let complete = directory_complete(
+                    &chapter_directory(&download_root(&files), &server_id, chapter_id),
+                    pages,
+                );
+                if !volumes_offline(&error) || !complete {
+                    model.write().status = connection_failure(&error);
+                    return;
+                }
+            }
+        }
+        {
+            let mut guard = model.write();
+            guard.remote_epoch = guard.remote_epoch.saturating_add(1);
+            guard.menu = false;
+            guard.zoom = 1;
+            guard.remote = Some(RemoteRead {
+                server_id: server_id.clone(),
+                series_id,
+                volume_id,
+                library_id,
+                chapter_id,
+                title,
+                kind: kind.clone(),
+                page,
+                page_count,
+                body: String::new(),
+                html: kind == "epub",
+                failed: false,
+                pdf: None,
+            });
+            guard.status = "Opening".to_owned();
+        }
+        show_page(model, page);
+    });
 }
 
 fn show_page(mut model: ModelSignal, page: i64) {
@@ -1307,11 +1367,13 @@ fn queue_and_run(mut model: ModelSignal, chapter_id: i64) {
     let queued = {
         let guard = model.read();
         let server_id = guard.kavita.server_id.clone();
-        let kind = guard
+        let chapter = guard
             .kavita
             .chapters
             .iter()
-            .find(|row| row.chapter_id == chapter_id)
+            .find(|row| row.chapter_id == chapter_id);
+        let series_id = chapter.map(|row| row.series_id).unwrap_or(0);
+        let kind = chapter
             .and_then(|chapter| {
                 guard
                     .kavita
@@ -1321,22 +1383,26 @@ fn queue_and_run(mut model: ModelSignal, chapter_id: i64) {
                     .map(|series| series.format.clone())
             })
             .unwrap_or_else(|| "image".to_owned());
-        let pages = guard
-            .kavita
-            .chapters
-            .iter()
-            .find(|row| row.chapter_id == chapter_id)
-            .map(|row| row.pages)
-            .unwrap_or(0);
-        (server_id, kind, pages)
+        let pages = chapter.map(|row| row.pages).unwrap_or(0);
+        (server_id, kind, pages, series_id)
     };
     std::thread::spawn(move || {
-        let (server_id, kind, pages) = queued;
+        let (server_id, kind, pages, series_id) = queued;
         let outcome = (|| {
             let (base, key, allow) = account(&server_id)?;
             let unmetered = !model.read().kavita.wifi_only || link_unmetered();
             let db = database()?;
-            queue_chapter(db, &server_id, &base, chapter_id, &kind)?;
+            let store = SecretStore::open(&app_files_dir())?;
+            admit_kavita_series(
+                db,
+                &store,
+                &app_files_dir(),
+                &server_id,
+                (&base, &key),
+                allow,
+                series_id,
+            )?;
+            queue_chapter(db, &server_id, &base, chapter_id, series_id, &kind)?;
             let root = download_root(&app_files_dir());
             let mut needle = String::from("kavita-");
             needle.push_str(&server_id);
@@ -1789,7 +1855,15 @@ fn sync_accounts_now() -> Result<String, SessionError> {
             Ok(false) => {}
             Err(_) => push_failed = true,
         }
-        match fetch_and_publish(db, &store, &server.id, &server.url, &key, allow) {
+        match fetch_and_publish(
+            db,
+            &store,
+            &app_files_dir(),
+            &server.id,
+            &server.url,
+            &key,
+            allow,
+        ) {
             Ok(found) => {
                 fetched = true;
                 gaps.extend(found.note());

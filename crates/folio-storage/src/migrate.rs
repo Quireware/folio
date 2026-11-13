@@ -99,7 +99,8 @@ CREATE TABLE IF NOT EXISTS history (
 );
 CREATE TABLE IF NOT EXISTS kavita_generation (
     server_id TEXT PRIMARY KEY,
-    published INTEGER NOT NULL
+    published INTEGER NOT NULL,
+    mutated INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS kavita_series (
     server_id TEXT NOT NULL,
@@ -178,7 +179,8 @@ CREATE TABLE IF NOT EXISTS kavita_download (
     id TEXT PRIMARY KEY,
     server_id TEXT NOT NULL,
     url TEXT NOT NULL,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    series_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS kavita_progress (
     server_id TEXT NOT NULL,
@@ -239,6 +241,19 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     ensure_column(conn, "bookmarks", "name", "TEXT")?;
     ensure_column(conn, "download_queue", "status", "TEXT")?;
     ensure_version(conn, 3)?;
+    ensure_version(conn, 4)?;
+    ensure_column(
+        conn,
+        "kavita_generation",
+        "mutated",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "kavita_download",
+        "series_id",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     Ok(())
 }
 

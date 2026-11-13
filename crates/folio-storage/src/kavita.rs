@@ -94,6 +94,8 @@ pub struct KavitaDownloadRow {
     pub url: String,
     /// `queued`, `running`, or `done`.
     pub status: String,
+    /// Kavita series id. Zero means unknown.
+    pub series_id: i64,
 }
 
 /// One progress push that has not been acknowledged.
@@ -165,8 +167,10 @@ pub enum KavitaKeep {
 /// Store `mirror` as the next generation and make it the visible one, in one transaction.
 ///
 /// `current` is shown the saved server row first. When the row is gone or `current` returns
-/// `false`, nothing is written and this returns `false`. Readers see the old generation or the
-/// new one, never a mixture, because the whole publish is one job on the writer thread.
+/// `false`, nothing is written and this returns `false`. `expected_mutated` must match
+/// [`kavita_mirror_mutated`] from before the fetch; a one-series drop in between refuses the
+/// publish so a stale list cannot restore a hidden series. Readers see the old generation or
+/// the new one, never a mixture, because the whole publish is one job on the writer thread.
 ///
 /// # Errors
 ///
@@ -175,6 +179,7 @@ pub fn publish_kavita_mirror<F>(
     db: &Database,
     server_id: &str,
     mirror: KavitaMirror,
+    expected_mutated: i64,
     current: F,
 ) -> Result<bool, StorageError>
 where
@@ -186,6 +191,9 @@ where
     }
     db.work(move |conn| {
         if !server_is_current(conn, &server_id, current)? {
+            return Ok(false);
+        }
+        if mutated_at(conn, &server_id)? != expected_mutated {
             return Ok(false);
         }
         let transaction = conn.transaction()?;
@@ -227,6 +235,9 @@ where
         }
         let published = published_generation(conn, &server_id)?;
         let transaction = conn.transaction()?;
+        if !series_is_published(&transaction, &server_id, series_id, published)? {
+            return Ok(false);
+        }
         transaction.execute(
             "DELETE FROM kavita_chapter WHERE server_id = ?1 AND series_id = ?2",
             params![server_id, series_id],
@@ -571,8 +582,45 @@ fn publish_generation(
         )?;
     }
     conn.execute(
-        "INSERT INTO kavita_generation (server_id, published) VALUES (?1, ?2)
+        "INSERT INTO kavita_generation (server_id, published, mutated) VALUES (?1, ?2, 0)
          ON CONFLICT(server_id) DO UPDATE SET published = excluded.published",
+        params![server_id, generation],
+    )?;
+    prune_omitted_dependents(conn, server_id, generation)
+}
+
+fn prune_omitted_dependents(
+    conn: &Connection,
+    server_id: &str,
+    generation: i64,
+) -> Result<(), StorageError> {
+    for table in ["kavita_shelf", "kavita_want", "kavita_bookmark"] {
+        conn.execute(
+            &format!(
+                "DELETE FROM {table}
+                 WHERE server_id = ?1 AND generation = ?2
+                   AND series_id NOT IN
+                    (SELECT series_id FROM kavita_series WHERE server_id = ?1 AND generation = ?2)"
+            ),
+            params![server_id, generation],
+        )?;
+    }
+    for table in ["kavita_outbox", "kavita_mark"] {
+        conn.execute(
+            &format!(
+                "DELETE FROM {table}
+                 WHERE server_id = ?1
+                   AND series_id NOT IN
+                    (SELECT series_id FROM kavita_series WHERE server_id = ?1 AND generation = ?2)"
+            ),
+            params![server_id, generation],
+        )?;
+    }
+    conn.execute(
+        "DELETE FROM kavita_progress
+         WHERE server_id = ?1
+           AND chapter_id NOT IN
+            (SELECT chapter_id FROM kavita_chapter WHERE server_id = ?1 AND generation = ?2)",
         params![server_id, generation],
     )?;
     Ok(())
@@ -879,6 +927,143 @@ fn delete_server_tables(conn: &Connection, server_id: &str) -> Result<(), Storag
     Ok(())
 }
 
+/// `kavita_generation.mutated` for `server_id`, or `0` when that row does not exist.
+///
+/// # Errors
+///
+/// Returns an error when the server id is empty or the writer cannot read.
+pub fn kavita_mirror_mutated(db: &Database, server_id: &str) -> Result<i64, StorageError> {
+    let server_id = owned_id(server_id)?;
+    db.work(move |conn| mutated_at(conn, &server_id))
+}
+
+/// Delete one download row. Returns whether a row was present.
+///
+/// # Errors
+///
+/// Returns an error when the writer cannot commit.
+pub fn delete_kavita_download(db: &Database, id: &str) -> Result<bool, StorageError> {
+    let id = id.to_owned();
+    db.work(move |conn| {
+        let changed = conn.execute("DELETE FROM kavita_download WHERE id = ?1", [&id])?;
+        Ok(changed == 1)
+    })
+}
+
+/// Drop one series from the published generation. `current` is the same check as
+/// [`publish_kavita_mirror`]. When it refuses, nothing is written and this returns `None`.
+///
+/// On success, `kavita_generation.mutated` increases by one and the published generation
+/// number is unchanged. Returns the download ids that were removed.
+///
+/// # Errors
+///
+/// Returns an error when the server id is empty or the writer cannot commit.
+pub fn drop_kavita_series<F>(
+    db: &Database,
+    server_id: &str,
+    series_id: i64,
+    current: F,
+) -> Result<Option<Vec<String>>, StorageError>
+where
+    F: FnOnce(&StoredServer) -> bool + Send + 'static,
+{
+    let server_id = owned_id(server_id)?;
+    db.work(move |conn| {
+        if !server_is_current(conn, &server_id, current)? {
+            return Ok(None);
+        }
+        let published = published_generation(conn, &server_id)?;
+        let transaction = conn.transaction()?;
+        let chapter_ids = chapter_ids_at(&transaction, &server_id, series_id, published)?;
+        let download_ids = download_ids_for_series(&transaction, &server_id, series_id)?;
+        transaction.execute(
+            "DELETE FROM kavita_series WHERE server_id = ?1 AND series_id = ?2 AND generation = ?3",
+            params![server_id, series_id, published],
+        )?;
+        transaction.execute(
+            "DELETE FROM kavita_chapter WHERE server_id = ?1 AND series_id = ?2 AND generation = ?3",
+            params![server_id, series_id, published],
+        )?;
+        transaction.execute(
+            "DELETE FROM kavita_shelf WHERE server_id = ?1 AND series_id = ?2 AND generation = ?3",
+            params![server_id, series_id, published],
+        )?;
+        transaction.execute(
+            "DELETE FROM kavita_want WHERE server_id = ?1 AND series_id = ?2 AND generation = ?3",
+            params![server_id, series_id, published],
+        )?;
+        transaction.execute(
+            "DELETE FROM kavita_bookmark WHERE server_id = ?1 AND series_id = ?2 AND generation = ?3",
+            params![server_id, series_id, published],
+        )?;
+        transaction.execute(
+            "DELETE FROM kavita_outbox WHERE server_id = ?1 AND series_id = ?2",
+            params![server_id, series_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM kavita_mark WHERE server_id = ?1 AND series_id = ?2",
+            params![server_id, series_id],
+        )?;
+        for chapter_id in chapter_ids {
+            transaction.execute(
+                "DELETE FROM kavita_progress WHERE server_id = ?1 AND chapter_id = ?2",
+                params![server_id, chapter_id],
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM kavita_download WHERE server_id = ?1 AND series_id = ?2",
+            params![server_id, series_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO kavita_generation (server_id, published, mutated) VALUES (?1, ?2, 1)
+             ON CONFLICT(server_id) DO UPDATE SET mutated = kavita_generation.mutated + 1",
+            params![server_id, published],
+        )?;
+        transaction.commit()?;
+        Ok(Some(download_ids))
+    })
+}
+
+/// Delete download rows whose series is not in the published generation.
+///
+/// A row with `series_id` 0 is mapped through the chapter id in its download id when that
+/// chapter is still stored. A row that cannot be mapped is left.
+///
+/// # Errors
+///
+/// Returns an error when the server id is empty or the writer cannot commit.
+pub fn drop_orphan_kavita_downloads(
+    db: &Database,
+    server_id: &str,
+) -> Result<Vec<String>, StorageError> {
+    let server_id = owned_id(server_id)?;
+    db.work(move |conn| {
+        let published = published_generation(conn, &server_id)?;
+        let keep = series_ids_at(conn, &server_id, published)?;
+        let rows = downloads_for_server(conn, &server_id)?;
+        let mut gone = Vec::new();
+        for row in rows {
+            let series_id = if row.series_id == 0 {
+                match chapter_id_from_download_id(&row.id) {
+                    Some(chapter_id) => {
+                        series_id_for_chapter(conn, &server_id, chapter_id)?.unwrap_or(0)
+                    }
+                    None => 0,
+                }
+            } else {
+                row.series_id
+            };
+            if series_id == 0 || keep.contains(&series_id) {
+                continue;
+            }
+            conn.execute("DELETE FROM kavita_download WHERE id = ?1", [&row.id])?;
+            gone.push(row.id);
+        }
+        Ok(gone)
+    })
+}
+
 /// Queue a download. A duplicate id goes back to `queued` unless it is running.
 ///
 /// # Errors
@@ -889,6 +1074,7 @@ pub fn enqueue_kavita_download(
     id: &str,
     server_id: &str,
     url: &str,
+    series_id: i64,
 ) -> Result<(), StorageError> {
     if id.is_empty() || url.is_empty() {
         return Err(StorageError::EmptyId);
@@ -898,10 +1084,14 @@ pub fn enqueue_kavita_download(
     let url = url.to_owned();
     db.work(move |conn| {
         conn.execute(
-            "INSERT INTO kavita_download (id, server_id, url, status) VALUES (?1, ?2, ?3, 'queued')
-             ON CONFLICT(id) DO UPDATE SET url = excluded.url, status = 'queued'
+            "INSERT INTO kavita_download (id, server_id, url, status, series_id)
+             VALUES (?1, ?2, ?3, 'queued', ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                url = excluded.url,
+                status = 'queued',
+                series_id = excluded.series_id
              WHERE kavita_download.status != 'running'",
-            params![id, server_id, url],
+            params![id, server_id, url, series_id],
         )?;
         Ok(())
     })
@@ -971,16 +1161,10 @@ pub fn kavita_downloads_by_status(
     let status = status.to_owned();
     db.work(move |conn| {
         let mut statement = conn.prepare(
-            "SELECT id, server_id, url, status FROM kavita_download WHERE status = ?1 ORDER BY id",
+            "SELECT id, server_id, url, status, series_id FROM kavita_download
+             WHERE status = ?1 ORDER BY id",
         )?;
-        let rows = statement.query_map([&status], |row| {
-            Ok(KavitaDownloadRow {
-                id: row.get(0)?,
-                server_id: row.get(1)?,
-                url: row.get(2)?,
-                status: row.get(3)?,
-            })
-        })?;
+        let rows = statement.query_map([&status], download_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StorageError::from)
     })
@@ -993,16 +1177,10 @@ pub fn kavita_downloads_by_status(
 /// Returns an error when the writer cannot read.
 pub fn kavita_downloads(db: &Database) -> Result<Vec<KavitaDownloadRow>, StorageError> {
     db.work(|conn| {
-        let mut statement =
-            conn.prepare("SELECT id, server_id, url, status FROM kavita_download ORDER BY id")?;
-        let rows = statement.query_map([], |row| {
-            Ok(KavitaDownloadRow {
-                id: row.get(0)?,
-                server_id: row.get(1)?,
-                url: row.get(2)?,
-                status: row.get(3)?,
-            })
-        })?;
+        let mut statement = conn.prepare(
+            "SELECT id, server_id, url, status, series_id FROM kavita_download ORDER BY id",
+        )?;
+        let rows = statement.query_map([], download_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StorageError::from)
     })
@@ -1302,6 +1480,115 @@ fn published_generation(conn: &Connection, server_id: &str) -> Result<i64, Stora
     }
 }
 
+fn mutated_at(conn: &Connection, server_id: &str) -> Result<i64, StorageError> {
+    let mut statement =
+        conn.prepare("SELECT mutated FROM kavita_generation WHERE server_id = ?1")?;
+    let mut rows = statement.query([server_id])?;
+    match rows.next()? {
+        Some(row) => Ok(row.get(0)?),
+        None => Ok(0),
+    }
+}
+
+fn series_is_published(
+    conn: &Connection,
+    server_id: &str,
+    series_id: i64,
+    published: i64,
+) -> Result<bool, StorageError> {
+    let mut statement = conn.prepare(
+        "SELECT 1 FROM kavita_series WHERE server_id = ?1 AND series_id = ?2 AND generation = ?3",
+    )?;
+    statement
+        .exists(params![server_id, series_id, published])
+        .map_err(StorageError::from)
+}
+
+fn chapter_ids_at(
+    conn: &Connection,
+    server_id: &str,
+    series_id: i64,
+    published: i64,
+) -> Result<Vec<i64>, StorageError> {
+    let mut statement = conn.prepare(
+        "SELECT chapter_id FROM kavita_chapter
+         WHERE server_id = ?1 AND series_id = ?2 AND generation = ?3
+         ORDER BY chapter_id",
+    )?;
+    let rows = statement.query_map(params![server_id, series_id, published], |row| row.get(0))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+fn series_ids_at(
+    conn: &Connection,
+    server_id: &str,
+    generation: i64,
+) -> Result<Vec<i64>, StorageError> {
+    let mut statement = conn.prepare(
+        "SELECT series_id FROM kavita_series
+         WHERE server_id = ?1 AND generation = ?2
+         ORDER BY series_id",
+    )?;
+    let rows = statement.query_map(params![server_id, generation], |row| row.get(0))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+fn downloads_for_server(
+    conn: &Connection,
+    server_id: &str,
+) -> Result<Vec<KavitaDownloadRow>, StorageError> {
+    let mut statement = conn.prepare(
+        "SELECT id, server_id, url, status, series_id FROM kavita_download
+         WHERE server_id = ?1 ORDER BY id",
+    )?;
+    let rows = statement.query_map([server_id], download_row)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+fn series_id_for_chapter(
+    conn: &Connection,
+    server_id: &str,
+    chapter_id: i64,
+) -> Result<Option<i64>, StorageError> {
+    let mut statement = conn
+        .prepare("SELECT series_id FROM kavita_chapter WHERE server_id = ?1 AND chapter_id = ?2")?;
+    let mut rows = statement.query(params![server_id, chapter_id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+fn chapter_id_from_download_id(id: &str) -> Option<i64> {
+    id.rsplit_once('-')?.1.parse().ok()
+}
+
+fn download_ids_for_series(
+    conn: &Connection,
+    server_id: &str,
+    series_id: i64,
+) -> Result<Vec<String>, StorageError> {
+    let mut statement = conn.prepare(
+        "SELECT id FROM kavita_download WHERE server_id = ?1 AND series_id = ?2 ORDER BY id",
+    )?;
+    let rows = statement.query_map(params![server_id, series_id], |row| row.get(0))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+fn download_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<KavitaDownloadRow> {
+    Ok(KavitaDownloadRow {
+        id: row.get(0)?,
+        server_id: row.get(1)?,
+        url: row.get(2)?,
+        status: row.get(3)?,
+        series_id: row.get(4)?,
+    })
+}
+
 fn read_outbox(
     conn: &Connection,
     server_id: &str,
@@ -1344,12 +1631,14 @@ fn owned_id(server_id: &str) -> Result<String, StorageError> {
 mod tests {
     use super::{
         acknowledge_kavita_mark, acknowledge_kavita_progress, apply_kavita_pull,
-        claim_kavita_download, enqueue_kavita_download, enqueue_kavita_mark,
-        enqueue_kavita_progress, forget_kavita_server, kavita_download_status, kavita_marks,
-        kavita_pending, publish_kavita_mirror, replace_kavita_chapters, reset_kavita_server,
-        settle_kavita_download, visible_kavita_chapters, visible_kavita_mirror,
-        visible_kavita_series, KavitaChapterRow, KavitaHomeRow, KavitaKeep, KavitaLibraryRow,
-        KavitaMarkRow, KavitaMirror, KavitaOutboxRow, KavitaSeriesRow,
+        claim_kavita_download, drop_kavita_series, drop_orphan_kavita_downloads,
+        enqueue_kavita_download, enqueue_kavita_mark, enqueue_kavita_progress,
+        forget_kavita_server, kavita_download_status, kavita_downloads, kavita_marks,
+        kavita_mirror_mutated, kavita_outbox, kavita_pending, publish_kavita_mirror,
+        published_generation, replace_kavita_chapters, reset_kavita_server, settle_kavita_download,
+        visible_kavita_chapters, visible_kavita_mirror, visible_kavita_series, KavitaBookmarkRow,
+        KavitaChapterRow, KavitaHomeRow, KavitaKeep, KavitaLibraryRow, KavitaMarkRow, KavitaMirror,
+        KavitaOutboxRow, KavitaSeriesRow,
     };
     use crate::catalog;
     use crate::queue::{servers, upsert_server, StoredServer};
@@ -1427,7 +1716,28 @@ mod tests {
     }
 
     fn publish(db: &Database, server_id: &str, mirror: KavitaMirror) -> bool {
-        publish_kavita_mirror(db, server_id, mirror, |_| true).expect("publish")
+        let mutated = kavita_mirror_mutated(db, server_id).expect("mutated");
+        publish_kavita_mirror(db, server_id, mirror, mutated, |_| true).expect("publish")
+    }
+
+    fn bookmark(id: i64, series_id: i64) -> KavitaBookmarkRow {
+        KavitaBookmarkRow {
+            bookmark_id: id,
+            series_id,
+            chapter_id: series_id * 10,
+            page: 1,
+        }
+    }
+
+    fn download(db: &Database, id: &str, series_id: i64) {
+        enqueue_kavita_download(db, id, "server-1", "http://127.0.0.1:9/chapter", series_id)
+            .expect("queue");
+    }
+
+    fn published_generation_for(db: &Database, server_id: &str) -> i64 {
+        let server_id = server_id.to_owned();
+        db.work(move |conn| published_generation(conn, &server_id))
+            .expect("generation")
     }
 
     fn chapters(db: &Database, series_id: i64, rows: Vec<KavitaChapterRow>) -> bool {
@@ -1507,9 +1817,13 @@ mod tests {
             ..with_series(&[(1, "Old")])
         };
         assert!(publish(&db, "server-1", first));
-        let refused = publish_kavita_mirror(&db, "server-1", with_series(&[(2, "New")]), |row| {
-            row.url == "http://elsewhere.test"
-        })
+        let refused = publish_kavita_mirror(
+            &db,
+            "server-1",
+            with_series(&[(2, "New")]),
+            kavita_mirror_mutated(&db, "server-1").expect("mutated"),
+            |row| row.url == "http://elsewhere.test",
+        )
         .expect("refused");
         assert!(!refused);
         assert_eq!(series_names(&db, "server-1"), ["Old"]);
@@ -1609,10 +1923,12 @@ mod tests {
     #[test]
     fn a_download_is_claimed_once_and_a_running_one_survives_an_enqueue() {
         let db = test_db();
-        enqueue_kavita_download(&db, "ch-9", "server-1", "http://127.0.0.1:9/ch-9").expect("queue");
+        enqueue_kavita_download(&db, "ch-9", "server-1", "http://127.0.0.1:9/ch-9", 1)
+            .expect("queue");
         assert!(claim_kavita_download(&db, "ch-9").expect("claim"));
         assert!(!claim_kavita_download(&db, "ch-9").expect("second claim"));
-        enqueue_kavita_download(&db, "ch-9", "server-1", "http://127.0.0.1:9/ch-9").expect("again");
+        enqueue_kavita_download(&db, "ch-9", "server-1", "http://127.0.0.1:9/ch-9", 1)
+            .expect("again");
         assert_eq!(
             kavita_download_status(&db, "ch-9")
                 .expect("status")
@@ -1621,7 +1937,8 @@ mod tests {
         );
         assert!(settle_kavita_download(&db, "ch-9", "done").expect("settle"));
         assert!(!settle_kavita_download(&db, "ch-9", "queued").expect("not running"));
-        enqueue_kavita_download(&db, "ch-9", "server-1", "http://127.0.0.1:9/ch-9").expect("redo");
+        enqueue_kavita_download(&db, "ch-9", "server-1", "http://127.0.0.1:9/ch-9", 1)
+            .expect("redo");
         assert_eq!(
             kavita_download_status(&db, "ch-9")
                 .expect("status")
@@ -1656,5 +1973,243 @@ mod tests {
             .iter()
             .all(|row| row.id != "server-2"));
         assert!(forget_kavita_server(&db, "server-2").is_err());
+    }
+
+    #[test]
+    fn drop_kavita_series_removes_one_series_and_leaves_the_generation() {
+        let db = test_db();
+        let first = KavitaMirror {
+            wants: vec![1, 2],
+            bookmarks: vec![bookmark(1, 1), bookmark(2, 2)],
+            shelves: vec![("on-deck".to_owned(), vec![1, 2])],
+            ..with_series(&[(1, "Wings"), (2, "Tide")])
+        };
+        assert!(publish(&db, "server-1", first));
+        assert!(chapters(&db, 1, vec![chapter(10, 1)]));
+        assert!(chapters(&db, 2, vec![chapter(20, 2)]));
+        apply_kavita_pull(&db, "server-1", 10, "page:1", 5).expect("progress");
+        enqueue_kavita_progress(
+            &db,
+            KavitaOutboxRow {
+                server_id: "server-1".to_owned(),
+                chapter_id: 10,
+                series_id: 1,
+                volume_id: 1,
+                library_id: 1,
+                locator: "page:2".to_owned(),
+                complete: false,
+                updated_at: 10,
+            },
+        )
+        .expect("outbox 1");
+        enqueue_kavita_progress(
+            &db,
+            KavitaOutboxRow {
+                server_id: "server-1".to_owned(),
+                chapter_id: 20,
+                series_id: 2,
+                volume_id: 1,
+                library_id: 1,
+                locator: "page:3".to_owned(),
+                complete: false,
+                updated_at: 10,
+            },
+        )
+        .expect("outbox 2");
+        enqueue_kavita_mark(
+            &db,
+            KavitaMarkRow {
+                server_id: "server-1".to_owned(),
+                scope: "series".to_owned(),
+                scope_id: 1,
+                series_id: 1,
+                volume_id: 0,
+                read: true,
+                updated_at: 10,
+            },
+        )
+        .expect("mark");
+        download(&db, "kavita-server-1-10", 1);
+        download(&db, "kavita-server-1-20", 2);
+        let published = published_generation_for(&db, "server-1");
+        let mutated = kavita_mirror_mutated(&db, "server-1").expect("mutated");
+        let gone = drop_kavita_series(&db, "server-1", 1, |_| true)
+            .expect("drop")
+            .expect("wrote");
+        assert_eq!(gone, ["kavita-server-1-10"]);
+        assert_eq!(series_names(&db, "server-1"), ["Tide"]);
+        assert!(chapter_ids(&db, 1).is_empty());
+        assert_eq!(chapter_ids(&db, 2), [20]);
+        let shown = visible_kavita_mirror(&db, "server-1").expect("mirror");
+        assert_eq!(shown.wants, [2]);
+        assert_eq!(shown.bookmarks.len(), 1);
+        assert_eq!(shown.bookmarks[0].series_id, 2);
+        assert_eq!(
+            shown.shelves.get("on-deck").map(Vec::as_slice),
+            Some(&[2][..])
+        );
+        assert!(kavita_pending(&db, "server-1", 10)
+            .expect("progress")
+            .is_none());
+        let outbox = kavita_outbox(&db, "server-1").expect("outbox");
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].series_id, 2);
+        assert!(kavita_marks(&db, "server-1").expect("marks").is_empty());
+        let downloads = kavita_downloads(&db).expect("downloads");
+        assert_eq!(downloads.len(), 1);
+        assert_eq!(downloads[0].id, "kavita-server-1-20");
+        assert_eq!(published_generation_for(&db, "server-1"), published);
+        assert_eq!(
+            kavita_mirror_mutated(&db, "server-1").expect("mutated"),
+            mutated + 1
+        );
+        db.work(|conn| {
+            let progress: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM kavita_progress WHERE server_id = ?1 AND chapter_id = 10",
+                ["server-1"],
+                |row| row.get(0),
+            )?;
+            assert_eq!(progress, 0);
+            assert!(catalog::items(conn).expect("items").is_empty());
+            Ok(())
+        })
+        .expect("catalog");
+    }
+
+    #[test]
+    fn a_refused_drop_writes_nothing() {
+        let db = test_db();
+        assert!(publish(&db, "server-1", with_series(&[(1, "Wings")])));
+        let mutated = kavita_mirror_mutated(&db, "server-1").expect("mutated");
+        let refused = drop_kavita_series(&db, "server-1", 1, |_| false).expect("check");
+        assert!(refused.is_none());
+        assert_eq!(series_names(&db, "server-1"), ["Wings"]);
+        assert_eq!(
+            kavita_mirror_mutated(&db, "server-1").expect("mutated"),
+            mutated
+        );
+    }
+
+    #[test]
+    fn a_stale_publish_does_not_restore_a_dropped_series() {
+        let db = test_db();
+        assert!(publish(
+            &db,
+            "server-1",
+            with_series(&[(1, "Wings"), (2, "Tide")])
+        ));
+        let mutated = kavita_mirror_mutated(&db, "server-1").expect("mutated");
+        drop_kavita_series(&db, "server-1", 1, |_| true)
+            .expect("drop")
+            .expect("wrote");
+        let restored = publish_kavita_mirror(
+            &db,
+            "server-1",
+            with_series(&[(1, "Wings"), (2, "Tide")]),
+            mutated,
+            |_| true,
+        )
+        .expect("stale");
+        assert!(!restored);
+        assert_eq!(series_names(&db, "server-1"), ["Tide"]);
+    }
+
+    #[test]
+    fn replace_kavita_chapters_refuses_a_series_that_is_not_published() {
+        let db = test_db();
+        assert!(publish(&db, "server-1", with_series(&[(1, "Wings")])));
+        drop_kavita_series(&db, "server-1", 1, |_| true)
+            .expect("drop")
+            .expect("wrote");
+        assert!(!chapters(&db, 1, vec![chapter(10, 1)]));
+        assert!(chapter_ids(&db, 1).is_empty());
+    }
+
+    #[test]
+    fn carried_bookmarks_of_an_omitted_series_are_gone() {
+        let db = test_db();
+        let first = KavitaMirror {
+            bookmarks: vec![bookmark(1, 1), bookmark(2, 2)],
+            wants: vec![1, 2],
+            shelves: vec![("on-deck".to_owned(), vec![1, 2])],
+            ..with_series(&[(1, "Wings"), (2, "Tide")])
+        };
+        assert!(publish(&db, "server-1", first));
+        enqueue_kavita_progress(
+            &db,
+            KavitaOutboxRow {
+                server_id: "server-1".to_owned(),
+                chapter_id: 10,
+                series_id: 1,
+                volume_id: 1,
+                library_id: 1,
+                locator: "page:2".to_owned(),
+                complete: false,
+                updated_at: 10,
+            },
+        )
+        .expect("outbox");
+        let second = KavitaMirror {
+            keep: vec![
+                KavitaKeep::Bookmarks,
+                KavitaKeep::Wants,
+                KavitaKeep::Shelf("on-deck".to_owned()),
+            ],
+            ..with_series(&[(2, "Tide")])
+        };
+        assert!(publish(&db, "server-1", second));
+        let shown = visible_kavita_mirror(&db, "server-1").expect("mirror");
+        assert_eq!(shown.bookmarks.len(), 1);
+        assert_eq!(shown.bookmarks[0].series_id, 2);
+        assert_eq!(shown.wants, [2]);
+        assert_eq!(
+            shown.shelves.get("on-deck").map(Vec::as_slice),
+            Some(&[2][..])
+        );
+        assert!(kavita_outbox(&db, "server-1").expect("outbox").is_empty());
+    }
+
+    #[test]
+    fn empty_chapters_keep_a_listed_series_download() {
+        let db = test_db();
+        assert!(publish(&db, "server-1", with_series(&[(1, "Wings")])));
+        assert!(chapters(&db, 1, vec![chapter(10, 1)]));
+        download(&db, "kavita-server-1-10", 1);
+        assert!(chapters(&db, 1, Vec::new()));
+        assert!(publish(&db, "server-1", with_series(&[(1, "Wings")])));
+        let gone = drop_orphan_kavita_downloads(&db, "server-1").expect("sweep");
+        assert!(gone.is_empty());
+        assert_eq!(
+            kavita_download_status(&db, "kavita-server-1-10")
+                .expect("status")
+                .as_deref(),
+            Some("queued")
+        );
+    }
+
+    #[test]
+    fn refresh_drops_a_download_after_chapters_were_cleared() {
+        let db = test_db();
+        assert!(publish(
+            &db,
+            "server-1",
+            with_series(&[(1, "Wings"), (2, "Tide")])
+        ));
+        assert!(chapters(&db, 1, vec![chapter(10, 1)]));
+        download(&db, "kavita-server-1-10", 1);
+        download(&db, "kavita-server-1-20", 2);
+        assert!(chapters(&db, 1, Vec::new()));
+        assert!(publish(&db, "server-1", with_series(&[(2, "Tide")])));
+        let gone = drop_orphan_kavita_downloads(&db, "server-1").expect("sweep");
+        assert_eq!(gone, ["kavita-server-1-10"]);
+        assert!(kavita_download_status(&db, "kavita-server-1-10")
+            .expect("status")
+            .is_none());
+        assert_eq!(
+            kavita_download_status(&db, "kavita-server-1-20")
+                .expect("status")
+                .as_deref(),
+            Some("queued")
+        );
     }
 }

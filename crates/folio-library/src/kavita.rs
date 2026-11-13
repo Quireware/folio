@@ -7,8 +7,8 @@ use std::io::Error as IoError;
 use std::path::Path;
 
 use folio_storage::{
-    claim_kavita_download, kavita_downloads, settle_kavita_download, Database, KavitaDownloadRow,
-    StorageError,
+    claim_kavita_download, kavita_download_status, kavita_downloads, settle_kavita_download,
+    Database, KavitaDownloadRow, StorageError,
 };
 use thiserror::Error;
 use url::Url;
@@ -94,6 +94,7 @@ where
         }
         let directory = root.join(&row.id);
         fs::create_dir_all(&directory)?;
+        abandon_if_gone(db, &row.id, &directory)?;
         let fetched = fetch(&row, &directory);
         let finished = matches!(fetched, Ok(true));
         if !finished {
@@ -102,7 +103,7 @@ where
         }
         let status = if finished { "done" } else { "queued" };
         if !settle_kavita_download(db, &row.id, status)? {
-            // Whoever reset or removed the row owns its directory now.
+            abandon_if_gone(db, &row.id, &directory)?;
             return Err(KavitaDownloadError::Stopped);
         }
         match fetched {
@@ -110,6 +111,14 @@ where
             Ok(false) => return Err(KavitaDownloadError::Incomplete),
             Err(error) => return Err(error.into()),
         }
+    }
+    Ok(())
+}
+
+fn abandon_if_gone(db: &Database, id: &str, directory: &Path) -> Result<(), KavitaDownloadError> {
+    if kavita_download_status(db, id)?.is_none() {
+        remove_partial(directory)?;
+        return Err(KavitaDownloadError::Stopped);
     }
     Ok(())
 }
@@ -155,7 +164,8 @@ pub fn same_origin(saved: &str, target: &str) -> bool {
 mod tests {
     use super::{leave_foreground, recover, run, same_origin, KavitaDownloadError};
     use folio_storage::{
-        claim_kavita_download, enqueue_kavita_download, kavita_download_status, Database,
+        claim_kavita_download, delete_kavita_download, enqueue_kavita_download,
+        kavita_download_status, Database,
     };
     use std::fs;
     use std::io::Error as IoError;
@@ -179,7 +189,8 @@ mod tests {
     fn metered_refuses_and_a_foreign_origin_is_rejected() {
         let db = test_db();
         let root = tempfile::tempdir().expect("root");
-        enqueue_kavita_download(&db, "ch-1", "server-1", "http://127.0.0.1:9/page").expect("queue");
+        enqueue_kavita_download(&db, "ch-1", "server-1", "http://127.0.0.1:9/page", 1)
+            .expect("queue");
         let error = run(
             &db,
             root.path(),
@@ -213,7 +224,8 @@ mod tests {
     fn leaving_foreground_deletes_the_partial_and_queues_from_the_start() {
         let db = test_db();
         let root = tempfile::tempdir().expect("root");
-        enqueue_kavita_download(&db, "ch-1", "server-1", "http://127.0.0.1:9/page").expect("queue");
+        enqueue_kavita_download(&db, "ch-1", "server-1", "http://127.0.0.1:9/page", 1)
+            .expect("queue");
         assert!(claim_kavita_download(&db, "ch-1").expect("running"));
         let partial = root.path().join("ch-1");
         fs::create_dir_all(&partial).expect("dir");
@@ -233,7 +245,8 @@ mod tests {
     fn a_complete_download_does_not_write_a_catalog_row() {
         let db = test_db();
         let root = tempfile::tempdir().expect("root");
-        enqueue_kavita_download(&db, "ch-1", "server-1", "http://127.0.0.1:9/page").expect("queue");
+        enqueue_kavita_download(&db, "ch-1", "server-1", "http://127.0.0.1:9/page", 1)
+            .expect("queue");
         run(
             &db,
             root.path(),
@@ -253,7 +266,7 @@ mod tests {
             Some("done")
         );
         assert!(db.catalog().expect("catalog").is_empty());
-        enqueue_kavita_download(&db, "ch-2", "server-1", "http://127.0.0.1:9/other")
+        enqueue_kavita_download(&db, "ch-2", "server-1", "http://127.0.0.1:9/other", 2)
             .expect("queue 2");
         let missing = run(
             &db,
@@ -276,8 +289,9 @@ mod tests {
     fn leaving_the_screen_during_a_fetch_stops_the_loop() {
         let db = test_db();
         let root = tempfile::tempdir().expect("root");
-        enqueue_kavita_download(&db, "ch-1", "server-1", "http://127.0.0.1:9/page").expect("queue");
-        enqueue_kavita_download(&db, "ch-2", "server-1", "http://127.0.0.1:9/next")
+        enqueue_kavita_download(&db, "ch-1", "server-1", "http://127.0.0.1:9/page", 1)
+            .expect("queue");
+        enqueue_kavita_download(&db, "ch-2", "server-1", "http://127.0.0.1:9/next", 2)
             .expect("queue 2");
         let mut fetched = Vec::new();
         let stopped = run(
@@ -303,5 +317,31 @@ mod tests {
                 Some("queued")
             );
         }
+    }
+
+    #[test]
+    fn a_fetch_that_loses_its_row_deletes_the_directory() {
+        let db = test_db();
+        let root = tempfile::tempdir().expect("root");
+        enqueue_kavita_download(&db, "ch-1", "server-1", "http://127.0.0.1:9/page", 1)
+            .expect("queue");
+        let stopped = run(
+            &db,
+            root.path(),
+            "http://127.0.0.1:9",
+            true,
+            true,
+            |row, dir| {
+                fs::write(dir.join("page-0"), b"partial")?;
+                delete_kavita_download(&db, &row.id).map_err(IoError::other)?;
+                Ok(true)
+            },
+        )
+        .expect_err("stopped");
+        assert!(matches!(stopped, KavitaDownloadError::Stopped));
+        assert!(!root.path().join("ch-1").exists());
+        assert!(kavita_download_status(&db, "ch-1")
+            .expect("status")
+            .is_none());
     }
 }

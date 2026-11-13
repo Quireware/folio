@@ -86,6 +86,9 @@ pub enum SessionError {
     /// The server was edited or removed while its replies were read, so they were not stored.
     #[error("the server was changed while Folio read it")]
     Changed,
+    /// This series is not in the Auth Key's Kavita list.
+    #[error("That series is not in the library.")]
+    Hidden,
     /// An edit would give a server the name another saved server has.
     #[error("a server with that name is already saved")]
     NameTaken,

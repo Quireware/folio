@@ -27,10 +27,11 @@ pub use collection::{
 };
 pub use kavita::{
     acknowledge_kavita_mark, acknowledge_kavita_progress, apply_kavita_pull, claim_kavita_download,
+    delete_kavita_download, drop_kavita_series, drop_orphan_kavita_downloads,
     enqueue_kavita_download, enqueue_kavita_mark, enqueue_kavita_progress, forget_kavita_server,
     kavita_download_status, kavita_downloads, kavita_downloads_by_status, kavita_marks,
-    kavita_outbox, kavita_pending, publish_kavita_mirror, replace_kavita_chapters,
-    reset_kavita_server, settle_kavita_download, visible_kavita_chapters,
+    kavita_mirror_mutated, kavita_outbox, kavita_pending, publish_kavita_mirror,
+    replace_kavita_chapters, reset_kavita_server, settle_kavita_download, visible_kavita_chapters,
     visible_kavita_collections, visible_kavita_filters, visible_kavita_mirror,
     visible_kavita_reading_lists, visible_kavita_series, KavitaBookmarkRow, KavitaChapterRow,
     KavitaDownloadRow, KavitaHomeRow, KavitaKeep, KavitaLibraryRow, KavitaMarkRow, KavitaMirror,
